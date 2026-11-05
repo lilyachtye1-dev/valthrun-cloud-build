@@ -1,0 +1,112 @@
+name: build-readonly-stage1
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout build configuration
+        uses: actions/checkout@v4
+        with:
+          path: build-config
+          persist-credentials: false
+
+      - name: Checkout pinned public kernel driver
+        uses: actions/checkout@v4
+        with:
+          repository: Valthrun/valthrun-driver-kernel
+          ref: bc8e18a27b15fbd55c4b37ebeb8252c60cec934f
+          path: kernel
+          persist-credentials: false
+
+      - name: Checkout pinned public PUBG controller
+        uses: actions/checkout@v4
+        with:
+          repository: Valthrun/Valthrun_PUBG
+          ref: a4e7464fc6146dc1cb145de84ade208d07583800
+          path: controller
+          persist-credentials: false
+
+      - name: Install the kernel Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2024-09-25
+          target: x86_64-unknown-uefi
+
+      - name: Install the controller Rust toolchain
+        shell: pwsh
+        run: rustup toolchain install nightly-2025-09-17 --profile minimal
+
+      - name: Verify and apply source patches
+        shell: pwsh
+        run: |
+          git -C kernel apply --check "$env:GITHUB_WORKSPACE/build-config/patches/kernel-readonly.patch"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git -C kernel apply "$env:GITHUB_WORKSPACE/build-config/patches/kernel-readonly.patch"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git -C controller apply --check "$env:GITHUB_WORKSPACE/build-config/patches/controller-manual-pid.patch"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git -C controller apply "$env:GITHUB_WORKSPACE/build-config/patches/controller-manual-pid.patch"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build read-only kernel driver and interface
+        shell: pwsh
+        working-directory: kernel
+        env:
+          RUSTUP_TOOLCHAIN: nightly-2024-09-25
+        run: |
+          ./.github/workflows/build-driver.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build --locked --release --lib --manifest-path driver-interface/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build manual-PID controller and read-only diagnostics
+        shell: pwsh
+        working-directory: controller
+        env:
+          RUSTUP_TOOLCHAIN: nightly-2025-09-17
+          RUSTFLAGS: -Ctarget-feature=+crt-static
+        run: |
+          cargo build --locked --release --bin pubg_controller
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build --locked --release --package valthrun-driver-interface --example readonly_diagnostics
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Stage artifacts and hashes
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path artifacts | Out-Null
+          Copy-Item kernel/target/x86_64-pc-windows-msvc/release/valthrun-driver.sys artifacts/
+          Copy-Item kernel/target/release/driver_interface_kernel.dll artifacts/
+          Copy-Item kernel/DriverCertificate.cer artifacts/
+          Copy-Item controller/target/release/pubg_controller.exe artifacts/
+          Copy-Item controller/target/release/examples/readonly_diagnostics.exe artifacts/
+          Copy-Item build-config/scripts/run-diagnostics.ps1 artifacts/
+          Copy-Item build-config/README-RU.md artifacts/
+          @"
+          Stage: 1 (build and read-only diagnostics only; not a validated 2611 radar)
+          Kernel source: https://github.com/Valthrun/valthrun-driver-kernel/commit/bc8e18a27b15fbd55c4b37ebeb8252c60cec934f
+          Controller source: https://github.com/Valthrun/Valthrun_PUBG/commit/a4e7464fc6146dc1cb145de84ade208d07583800
+          Target game build: 2611.1.1.37 (schema adaptation and live validation are NOT complete)
+          Driver handlers: initialize, process list, module list, memory read
+          Disabled handlers/features: write, input, process protection, metrics
+          Controller: accepts kernel-driver and requires PUBG_PROCESS_ID; no automatic TslGame.exe selection
+          "@ | Set-Content -Path artifacts/BUILD-INFO.txt -Encoding utf8
+          Get-ChildItem artifacts -File | Sort-Object Name | ForEach-Object {
+              $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+              "$hash  $($_.Name)"
+          } | Set-Content -Path artifacts/SHA256SUMS.txt -Encoding ascii
+
+      - name: Upload stage-1 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: valthrun-readonly-stage1
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 14
