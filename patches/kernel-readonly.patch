@@ -1,0 +1,154 @@
+diff --git a/driver/src/handler/init.rs b/driver/src/handler/init.rs
+index 9160bb7..6a22d5a 100644
+--- a/driver/src/handler/init.rs
++++ b/driver/src/handler/init.rs
+@@ -9,12 +9,6 @@ use vtd_protocol::{
+     PROTOCOL_VERSION,
+ };
+ 
+-use crate::{
+-    KEYBOARD_INPUT,
+-    METRICS_CLIENT,
+-    MOUSE_INPUT,
+-};
+-
+ fn driver_version() -> VersionInfo {
+     let mut info = VersionInfo::default();
+     info.set_application_name(obfstr!("kernel-driver"));
+@@ -32,34 +26,11 @@ pub fn handler_init(command: &mut DriverCommandInitialize) -> anyhow::Result<()>
+         return Ok(());
+     }
+ 
+-    let feature_mouse = if unsafe { &*MOUSE_INPUT.get() }.is_some() {
+-        DriverFeature::InputMouse
+-    } else {
+-        DriverFeature::empty()
+-    };
+-
+-    let feature_keyboard = if unsafe { &*KEYBOARD_INPUT.get() }.is_some() {
+-        DriverFeature::InputKeyboard
+-    } else {
+-        DriverFeature::empty()
+-    };
+-
+-    let feature_metrics = if unsafe { &*METRICS_CLIENT.get() }.is_some() {
+-        DriverFeature::Metrics
+-    } else {
+-        DriverFeature::empty()
+-    };
+-
+     command.result = InitializeResult::Success;
+     command.driver_version = driver_version();
+     command.driver_features = DriverFeature::ProcessList |
+         DriverFeature::ProcessModules |
+-        DriverFeature::MemoryRead |
+-        DriverFeature::MemoryWrite |
+-        feature_mouse |
+-        feature_keyboard |
+-        feature_metrics |
+-        DriverFeature::ProcessProtectionKernel;
++        DriverFeature::MemoryRead;
+ 
+     Ok(())
+ }
+diff --git a/driver/src/lib.rs b/driver/src/lib.rs
+index 2b4d4ad..ce99770 100644
+--- a/driver/src/lib.rs
++++ b/driver/src/lib.rs
+@@ -11,10 +11,7 @@ use alloc::{
+     format,
+     string::String,
+ };
+-use core::{
+-    cell::SyncUnsafeCell,
+-    time::Duration,
+-};
++use core::cell::SyncUnsafeCell;
+ 
+ use anyhow::Context;
+ use device::ValthrunDevice;
+@@ -33,7 +30,6 @@ use obfstr::{
+     obfstr,
+     obfstring,
+ };
+-use status::CSTATUS_DRIVER_INIT_FAILED_PP;
+ use vtk_wsk::WskInstance;
+ use winapi::{
+     km::wdm::DRIVER_OBJECT,
+@@ -46,12 +42,7 @@ use winapi::{
+ use crate::{
+     handler::{
+         handler_init,
+-        handler_keyboard_state,
+-        handler_metrics_record,
+-        handler_mouse_move,
+-        handler_protection_toggle,
+         handler_read,
+-        handler_write,
+     },
+     metrics::RECORD_TYPE_DRIVER_STATUS,
+     offsets::initialize_nt_offsets,
+@@ -120,9 +111,6 @@ pub extern "system" fn driver_unload() {
+     let request_handler = unsafe { &mut *REQUEST_HANDLER.get() };
+     let _ = request_handler.take();
+ 
+-    /* Uninstall process protection */
+-    process_protection::finalize();
+-
+     let keyboard_input = unsafe { &mut *KEYBOARD_INPUT.get() };
+     let _ = keyboard_input.take();
+ 
+@@ -194,36 +182,7 @@ pub fn inner_driver_entry(
+     *error_code = CSTATUS_DRIVER_INIT_FAILED;
+     kapi::initialize(Some(driver)).with_context(|| obfstring!("initialize SEH"))?;
+ 
+-    unsafe {
+-        *WSK.get() =
+-            Some(WskInstance::create(1 << 8).with_context(|| obfstring!("initialize WSK"))?)
+-    };
+-    unsafe {
+-        *METRICS_CLIENT.get() =
+-            Some(metrics::initialize().with_context(|| obfstring!("initialize metrics"))?);
+-
+-        *METRICS_HEARTBEAT.get() = Some(MetricsHeartbeat::new(Duration::from_secs(60 * 60)));
+-    };
+-
+     initialize_nt_offsets().with_context(|| obfstring!("initialize NT_OFFSETS"))?;
+-    unsafe {
+-        *KEYBOARD_INPUT.get() =
+-            Some(kb::create_keyboard_input().with_context(|| obfstring!("initialize keyboard"))?)
+-    };
+-
+-    unsafe {
+-        *MOUSE_INPUT.get() =
+-            Some(mouse::create_mouse_input().with_context(|| obfstring!("initialize mouse"))?)
+-    };
+-
+-    {
+-        /* extra error code for process protection */
+-        *error_code = CSTATUS_DRIVER_INIT_FAILED_PP;
+-        process_protection::initialize()
+-            .with_context(|| obfstring!("initialize process protection"))?;
+-        *error_code = CSTATUS_DRIVER_INIT_FAILED;
+-    }
+-
+     let device =
+         ValthrunDevice::create(driver).with_context(|| obfstring!("create Valthrun device"))?;
+     log::debug!(
+@@ -239,16 +198,9 @@ pub fn inner_driver_entry(
+     handler.register(&handler_init);
+ 
+     handler.register(&handler_read);
+-    handler.register(&handler_write);
+ 
+     handler.register(&handler_get_modules);
+     handler.register(&handler_get_processes);
+-    handler.register(&handler_protection_toggle);
+-
+-    handler.register(&handler_mouse_move);
+-    handler.register(&handler_keyboard_state);
+-
+-    handler.register(&handler_metrics_record);
+ 
+     unsafe { *REQUEST_HANDLER.get() = Some(handler) };
+ 

@@ -1,0 +1,229 @@
+diff --git a/driver/interface/examples/readonly_diagnostics.rs b/driver/interface/examples/readonly_diagnostics.rs
+new file mode 100644
+index 0000000..51786d0
+--- /dev/null
++++ b/driver/interface/examples/readonly_diagnostics.rs
+@@ -0,0 +1,115 @@
++use std::env;
++
++use anyhow::{
++    bail,
++    Context,
++};
++use valthrun_driver_interface::{
++    DirectoryTableType,
++    DriverFeature,
++    DriverInterface,
++    ProcessId,
++};
++
++fn parse_pid() -> anyhow::Result<ProcessId> {
++    let value = env::args().nth(1).ok_or_else(|| {
++        anyhow::anyhow!(
++            "Usage: readonly_diagnostics.exe <decimal TslGame.exe PID>; no process is selected automatically"
++        )
++    })?;
++
++    value
++        .parse::<ProcessId>()
++        .with_context(|| format!("Invalid decimal process id: {}", value))
++}
++
++pub fn main() -> anyhow::Result<()> {
++    env_logger::builder().parse_default_env().init();
++    let process_id = parse_pid()?;
++    let interface = DriverInterface::create_from_env()?;
++
++    println!(
++        "Driver: {} v{}.{}.{}",
++        interface
++            .driver_version()
++            .get_application_name()
++            .unwrap_or("<invalid>"),
++        interface.driver_version().version_major,
++        interface.driver_version().version_minor,
++        interface.driver_version().version_patch
++    );
++    println!("Features: {:?}", interface.driver_features());
++
++    let forbidden = DriverFeature::MemoryWrite
++        | DriverFeature::InputKeyboard
++        | DriverFeature::InputMouse
++        | DriverFeature::ProcessProtectionKernel
++        | DriverFeature::ProcessProtectionZenith
++        | DriverFeature::Metrics;
++    if interface.driver_features().intersects(forbidden) {
++        bail!("Read-only check failed: the driver advertises forbidden features");
++    }
++
++    let processes = interface.list_processes()?;
++    println!("Processes reported by the driver: {}", processes.len());
++    for candidate in processes.iter().filter(|process| {
++        process
++            .get_image_base_name()
++            .unwrap_or_default()
++            .eq_ignore_ascii_case("TslGame.exe")
++    }) {
++        println!("  TslGame.exe candidate PID: {}", candidate.process_id);
++    }
++
++    let selected = processes
++        .iter()
++        .find(|process| process.process_id == process_id)
++        .with_context(|| format!("The manually selected PID {} was not found", process_id))?;
++    let image_name = selected.get_image_base_name().unwrap_or("<invalid>");
++    if !image_name.eq_ignore_ascii_case("TslGame.exe") {
++        bail!(
++            "PID {} belongs to '{}', not TslGame.exe; refusing to continue",
++            process_id,
++            image_name
++        );
++    }
++    println!("Manually selected: PID {} ({})", process_id, image_name);
++
++    let modules = interface.list_modules(process_id, DirectoryTableType::Default)?;
++    println!("Modules: {}", modules.len());
++    for module in &modules {
++        println!(
++            "  {:016X} {:10X} {}",
++            module.base_address,
++            module.module_size,
++            module.get_base_dll_name().unwrap_or("<invalid>")
++        );
++    }
++
++    let game_module = modules
++        .iter()
++        .find(|module| {
++            module
++                .get_base_dll_name()
++                .unwrap_or_default()
++                .eq_ignore_ascii_case("TslGame.exe")
++        })
++        .context("TslGame.exe module was not found in the selected process")?;
++    let header = interface.read::<[u8; 16]>(
++        process_id,
++        DirectoryTableType::Default,
++        game_module.base_address,
++    )?;
++    println!(
++        "Read {} bytes at 0x{:X}: {:02X?}",
++        header.len(),
++        game_module.base_address,
++        header
++    );
++    if !header.starts_with(b"MZ") {
++        bail!("The read completed but the module header does not start with MZ");
++    }
++
++    println!("READ_ONLY_DIAGNOSTICS_OK");
++    Ok(())
++}
+diff --git a/pubg/src/handle.rs b/pubg/src/handle.rs
+index 3214041..d722015 100644
+--- a/pubg/src/handle.rs
++++ b/pubg/src/handle.rs
+@@ -1,6 +1,7 @@
+ #![allow(dead_code)]
+ 
+ use std::{
++    env,
+     error::Error,
+     ffi::CStr,
+     fmt::Debug,
+@@ -29,12 +30,10 @@ use valthrun_driver_interface::{
+     DirectoryTableType,
+     DriverFeature,
+     DriverInterface,
+-    InterfaceError,
+     KeyboardState,
+     MouseState,
+     ProcessId,
+     ProcessModuleInfo,
+-    ProcessProtectionMode,
+ };
+ 
+ use crate::{
+@@ -89,42 +88,55 @@ impl PubgHandle {
+     pub fn create(metrics: bool) -> anyhow::Result<Arc<Self>> {
+         let interface = DriverInterface::create_from_env()?;
+ 
+-        if interface
+-            .driver_features()
+-            .contains(DriverFeature::ProcessProtectionKernel)
+-        {
+-            /*
+-             * Please no not analyze me:
+-             * https://www.unknowncheats.me/wiki/Valve_Anti-Cheat:VAC_external_tool_detection_(and_more)
+-             *
+-             * Even tough we don't have open handles to Pubg we don't want anybody to read our process.
+-             */
+-            if let Err(err) = interface.toggle_process_protection(ProcessProtectionMode::Kernel) {
+-                log::warn!("Failed to enable process protection: {}", err)
+-            };
+-        }
+-
+         let driver_name = interface
+             .driver_version()
+             .get_application_name()
+             .unwrap_or("<invalid>");
+ 
+-        if driver_name != obfstr!("zenith-driver") {
+-            return Err(InterfaceError::NotZenithDriver.into());
++        if driver_name != obfstr!("kernel-driver") {
++            return Err(anyhow::anyhow!(
++                "Unsupported driver '{}'; expected the self-built kernel-driver",
++                driver_name
++            ));
++        }
++
++        let forbidden_features = DriverFeature::MemoryWrite
++            | DriverFeature::InputKeyboard
++            | DriverFeature::InputMouse
++            | DriverFeature::ProcessProtectionKernel
++            | DriverFeature::ProcessProtectionZenith
++            | DriverFeature::Metrics;
++        if interface.driver_features().intersects(forbidden_features) {
++            return Err(anyhow::anyhow!(
++                "Refusing non-read-only driver features: {:?}",
++                interface.driver_features()
++            ));
+         }
+ 
+-        let process = interface
+-            .list_processes()?
++        let requested_process_id = env::var("PUBG_PROCESS_ID")
++            .context("PUBG_PROCESS_ID is required; enter the desired TslGame.exe PID manually")?
++            .parse::<ProcessId>()
++            .context("PUBG_PROCESS_ID must be a decimal process id")?;
++
++        let processes = interface.list_processes()?;
++        for candidate in processes.iter().filter(|process| {
++            process.get_image_base_name().unwrap_or_default() == obfstr!("TslGame.exe")
++        }) {
++            log::info!("Manual PUBG candidate: PID {}", candidate.process_id);
++        }
++
++        let process = processes
+             .into_iter()
+-            .filter(|process| {
+-                process.get_image_base_name().unwrap_or_default() == obfstr!("TslGame.exe")
++            .find(|process| {
++                process.process_id == requested_process_id
++                    && process.get_image_base_name().unwrap_or_default() == obfstr!("TslGame.exe")
+             })
+-            .collect::<Vec<_>>();
+-        let process = if process.is_empty() {
+-            return Err(InterfaceError::ProcessUnknown.into());
+-        } else {
+-            process.last().unwrap()
+-        };
++            .ok_or_else(|| {
++                anyhow::anyhow!(
++                    "PID {} was not found as TslGame.exe; refusing automatic process selection",
++                    requested_process_id
++                )
++            })?;
+ 
+         let modules = interface.list_modules(process.process_id, DirectoryTableType::Default)?;
+         log::debug!(
