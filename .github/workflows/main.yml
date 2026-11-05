@@ -61,6 +61,8 @@ jobs:
         env:
           RUSTUP_TOOLCHAIN: nightly-2024-09-25
         run: |
+          cargo update -p compiler_builtins --precise 0.1.132
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           ./.github/workflows/build-driver.ps1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo build --locked --release --lib --manifest-path driver-interface/Cargo.toml
